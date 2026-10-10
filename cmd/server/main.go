@@ -40,7 +40,8 @@ func main() {
 	var (
 		port       = flag.Int("port", 7000, "隧道 UDP 端口")
 		tunName    = flag.String("tun", "iptun0", "TUN 设备名")
-		mtu        = flag.Int("mtu", common.MTU, "TUN MTU")
+		mtu        = flag.Int("mtu", common.MTU, "TUN 设备 MTU")
+		pace       = flag.Int("pace", 800, "隧道 UDP 发送速率上限（包/秒），平滑突发避免被链路整形，0=关闭")
 		configPath = flag.String("config", "/root/iptun/clients.json", "客户端配置文件")
 		webAddr    = flag.String("web", ":8443", "Web 管理界面监听地址（HTTPS）")
 		webUser    = flag.String("webuser", "admin", "Web 管理员账号")
@@ -89,10 +90,10 @@ func main() {
 		log.Fatalf("create tun: %v", err)
 	}
 	defer tunFile.Close()
-	if err := setupNetworking(wan, actualTun, tunnelPort, webPort, *mtu-80, cfg); err != nil {
+	if err := setupNetworking(wan, actualTun, tunnelPort, webPort, *mtu, cfg); err != nil {
 		log.Fatalf("setup networking: %v", err)
 	}
-	defer cleanupNetworking(wan, actualTun)
+	defer cleanupNetworking(wan, actualTun, *mtu)
 	log.Printf("policy routing installed for %d client(s)", len(cfg.Clients))
 
 	addr, _ := net.ResolveUDPAddr("udp4", fmt.Sprintf(":%d", tunnelPort))
@@ -102,6 +103,7 @@ func main() {
 	}
 	_ = udpConn.SetReadBuffer(8 * 1024 * 1024)
 	_ = udpConn.SetWriteBuffer(8 * 1024 * 1024)
+	logSockBuffers(udpConn, 8*1024*1024)
 
 	srv := &server{
 		udp:        udpConn,
@@ -109,9 +111,9 @@ func main() {
 		tunName:    actualTun,
 		wan:        wan,
 		mtu:        *mtu,
-		webPort:    webPort,
 		cfg:        cfg,
 		configPath: *configPath,
+		pacer:      common.NewPacer(*pace, 256),
 		byLanding:  map[uint32]*clientSession{},
 		byAddr:     map[string]*clientSession{},
 	}
@@ -165,7 +167,7 @@ type clientSession struct {
 	landing  uint32
 	addr     *net.UDPAddr
 	key      *common.Session
-	lastSeen atomic.Int64 // unix nano
+	lastSeen atomic.Int64  // unix nano
 	rxBytes  atomic.Uint64 // 客户端 -> 公网（出向）
 	txBytes  atomic.Uint64 // 公网 -> 客户端（入向）
 	pkts     atomic.Uint64
@@ -181,6 +183,7 @@ type server struct {
 	webPort    int
 	cfg        *NodeConfig
 	configPath string
+	pacer      *common.Pacer
 
 	mu        sync.RWMutex
 	byLanding map[uint32]*clientSession
@@ -203,6 +206,7 @@ func (s *server) rebindTunnel(newPort int) error {
 	}
 	_ = c.SetReadBuffer(8 * 1024 * 1024)
 	_ = c.SetWriteBuffer(8 * 1024 * 1024)
+	logSockBuffers(c, 8*1024*1024)
 
 	s.connMu.Lock()
 	old := s.udp
@@ -280,7 +284,7 @@ func (s *server) gcLoop() {
 
 // reloadNetworking 配置热更新后重建规则（供 Web 调用）。
 func (s *server) reloadNetworking() error {
-	return setupNetworking(s.wan, s.tunName, s.cfg.TunnelPort, s.webPort, s.mtu-80, s.cfg)
+	return setupNetworking(s.wan, s.tunName, s.cfg.TunnelPort, s.webPort, s.mtu, s.cfg)
 }
 
 // ---------------- UDP 侧 ----------------
@@ -298,8 +302,7 @@ func (s *server) readUDP() {
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
-		raw := make([]byte, n)
-		copy(raw, buf[:n])
+		raw := buf[:n] // 处理全程同步（含 tun.Write），下次 Read 前不再使用，无需复制
 		if len(raw) < common.HeaderSize {
 			continue
 		}
@@ -319,6 +322,7 @@ func (s *server) readUDP() {
 		switch t {
 		case common.TypePing:
 			pkt := sess.key.Seal(common.TypePong, nil, common.RandomPrefix())
+			s.pacer.Wait()
 			_, _ = conn.WriteToUDP(pkt, raddr)
 		case common.TypeData:
 			if len(body) == 0 {
@@ -414,6 +418,7 @@ func (s *server) readTunnel() {
 			continue
 		}
 		pkt := sess.key.Seal(common.TypeData, buf[:n], common.RandomPrefix())
+		s.pacer.Wait()
 		if _, err := s.curUDP().WriteToUDP(pkt, sess.addr); err == nil {
 			sess.txBytes.Add(uint64(n))
 			sess.pkts.Add(1)

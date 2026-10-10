@@ -54,6 +54,7 @@ func run() {
 		server    = flag.String("server", fc.Server, "服务器隧道地址 host:port（如 1.2.3.4:7000）")
 		token     = flag.String("token", fc.Token, "授权 Token（同时是该客户端的隧道加密密钥，在 Web 控制台创建后获得）")
 		adapterNm = flag.String("adapter", fc.Adapter, "wintun 适配器名称（一机多客户端时分别指定，如 IPTUNA）")
+		pace      = flag.Int("pace", 800, "隧道 UDP 发送速率上限（包/秒），平滑突发避免被运营商整形，0=关闭")
 	)
 	flag.Parse()
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
@@ -82,35 +83,10 @@ func run() {
 		log.Fatalf("server must be an IPv4 address: %s", serverHost)
 	}
 
-	// 1) 找到当前默认上网物理网卡（索引 / 网关 / 本机 IP）
-	phys, err := detectPhysicalAdapter()
-	if err != nil {
-		log.Fatalf("detect physical adapter: %v", err)
-	}
-	log.Printf("physical adapter: idx=%s ip=%s gw=%s", phys.Idx, phys.IP, phys.Gateway)
+	// 物理网卡（索引/网关/IP）在传输重连循环内动态发现：
+	// 换网、DHCP 换 IP、网卡抖动后重连可自动适配，无需重启服务。
 
-	// 2) 连接服务器（UDP 绑定物理网卡 IP，防止封装流量被吸入 wintun）
-	laddr, _ := net.ResolveUDPAddr("udp4", net.JoinHostPort(phys.IP, "0"))
-	raddr, _ := net.ResolveUDPAddr("udp4", *server)
-	udpConn, err := net.DialUDP("udp4", laddr, raddr)
-	if err != nil {
-		log.Fatalf("dial server: %v", err)
-	}
-	defer udpConn.Close()
-	_ = udpConn.SetReadBuffer(4 * 1024 * 1024)
-	_ = udpConn.SetWriteBuffer(4 * 1024 * 1024)
-
-	// 3) 握手（Token 即授权码又即加密根密钥，重试直到成功）
-	cfg, dataSess, err := handshake(udpConn, *token)
-	if err != nil {
-		log.Fatalf("handshake: %v（请检查 Token 是否在服务端已创建并启用）", err)
-	}
-	// 清除握手阶段的读写超时，数据信道长期阻塞
-	_ = udpConn.SetReadDeadline(time.Time{})
-	_ = udpConn.SetWriteDeadline(time.Time{})
-	log.Printf("handshake ok, tun config: %+v", cfg)
-
-	// 4) 创建 wintun 适配器并配置地址/路由
+	// 1) 创建 wintun 适配器（仅需管理员/驱动，与网络无关，失败直接退出）
 	adapter, err := wintun.CreateAdapter(*adapterNm, "iptun", nil)
 	if err != nil {
 		log.Fatalf("create wintun adapter: %v（确认 wintun.dll 与程序同目录且以管理员运行）", err)
@@ -119,11 +95,6 @@ func run() {
 
 	tunIdx := adapterIndex(*adapterNm)
 	log.Printf("wintun adapter %s ready, ifIndex=%s", *adapterNm, tunIdx)
-
-	if err := configureNetworking(*adapterNm, tunIdx, cfg, phys, serverIP.String()); err != nil {
-		log.Fatalf("configure networking: %v", err)
-	}
-	defer cleanupNetworking(*adapterNm, tunIdx, cfg, phys, serverIP.String())
 
 	session, err := adapter.StartSession(0x400000) // 4 MiB ring
 	if err != nil {
@@ -137,27 +108,26 @@ func run() {
 		bootSess.Seal(common.TypePing, nil, common.RandomPrefix())
 	}
 	c := &client{
-		udp:       udpConn,
 		session:   session,
-		data:      dataSess,
 		boot:      bootSess,
 		token:     *token,
-		mtu:       cfg.MTU,
+		mtu:       common.MTU,
 		server:    *server,
 		adapter:   *adapterNm,
-		landing:   cfg.TunIP,
+		tunIdx:    tunIdx,
+		serverIP:  serverIP.String(),
 		startedAt: startedAt,
+		pacer:     common.NewPacer(*pace, 256),
 	}
-	writeStatus(&StatusInfo{State: "connected", Server: *server, Adapter: *adapterNm,
-		LandingIP: cfg.TunIP, MTU: cfg.MTU, PID: os.Getpid(),
-		StartedAt: startedAt, LastSeen: time.Now().Format("2006-01-02 15:04:05"),
-		Message: "已连接，公网端口落地中"})
-	log.Printf("iptun client running: public services now land on this PC via %s", serverHost)
+
+	// 传输层（拨号/握手/读取）独立重连；wintun 侧收发与心跳常驻
+	go c.transportLoop()
 	c.run()
 }
 
 type client struct {
 	udp       *net.UDPConn
+	connMu    sync.RWMutex
 	session   wintun.Session
 	mu        sync.Mutex
 	data      *common.Session
@@ -167,14 +137,22 @@ type client struct {
 	mtu       int
 	server    string
 	adapter   string
+	tunIdx    string
+	serverIP  string
 	landing   string
 	startedAt string
+	pacer     *common.Pacer
 	activity  atomic.Int64
+}
+
+func (c *client) curUDP() *net.UDPConn {
+	c.connMu.RLock()
+	defer c.connMu.RUnlock()
+	return c.udp
 }
 
 func (c *client) run() {
 	go c.wintunToServer()
-	go c.serverToWintun()
 	go c.heartbeat()
 	select {}
 }
@@ -183,6 +161,90 @@ func (c *client) currentKey() *common.Session {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.data
+}
+
+// transportLoop 持续维护"拨号 → 握手 → 配置网络 → 读取"的传输生命周期：
+// 读取返回错误（断网/NAT 失效/物理网卡变化）或握手失败时，退避后整体重来。
+// wintun 适配器与会话保持不变，业务无需重启服务即可自愈。
+func (c *client) transportLoop() {
+	backoff := time.Second
+	for {
+		phys, err := detectPhysicalAdapter()
+		if err != nil {
+			log.Printf("waiting for physical network: %v", err)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		laddr, _ := net.ResolveUDPAddr("udp4", net.JoinHostPort(phys.IP, "0"))
+		raddr, _ := net.ResolveUDPAddr("udp4", c.server)
+		conn, err := net.DialUDP("udp4", laddr, raddr)
+		if err != nil {
+			log.Printf("dial server: %v", err)
+			time.Sleep(backoff)
+			if backoff < 10*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		_ = conn.SetReadBuffer(8 * 1024 * 1024)
+		_ = conn.SetWriteBuffer(8 * 1024 * 1024)
+
+		cfg, sess, err := handshake(conn, c.token)
+		if err != nil {
+			_ = conn.Close()
+			log.Printf("handshake: %v", err)
+			time.Sleep(backoff)
+			if backoff < 10*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		_ = conn.SetReadDeadline(time.Time{})
+		_ = conn.SetWriteDeadline(time.Time{})
+
+		if err := configureNetworking(c.adapter, c.tunIdx, cfg, phys, c.serverIP); err != nil {
+			_ = conn.Close()
+			log.Printf("configure networking: %v", err)
+			time.Sleep(backoff)
+			continue
+		}
+
+		c.mu.Lock()
+		c.data = sess
+		c.pending = nil
+		c.mtu = cfg.MTU
+		c.landing = cfg.TunIP
+		c.mu.Unlock()
+		c.connMu.Lock()
+		old := c.udp
+		c.udp = conn
+		c.connMu.Unlock()
+		if old != nil {
+			_ = old.Close()
+		}
+		backoff = time.Second
+		c.touchActivity()
+		writeStatus(&StatusInfo{State: "connected", Server: c.server, Adapter: c.adapter,
+			LandingIP: cfg.TunIP, MTU: cfg.MTU, PID: os.Getpid(),
+			StartedAt: c.startedAt, LastSeen: time.Now().Format("2006-01-02 15:04:05"),
+			Message: "已连接，公网端口落地中"})
+		log.Printf("tunnel established: landing=%s mtu=%d via %s", cfg.TunIP, cfg.MTU, phys.IP)
+
+		// 阻塞在读循环直到连接失效
+		c.readServerLoop(conn)
+		_ = conn.Close()
+		c.connMu.Lock()
+		if c.udp == conn {
+			c.udp = nil
+		}
+		c.connMu.Unlock()
+		writeStatus(&StatusInfo{State: "connecting", Server: c.server, Adapter: c.adapter,
+			LandingIP: c.landing, MTU: c.mtu, PID: os.Getpid(),
+			StartedAt: c.startedAt, LastSeen: time.Now().Format("2006-01-02 15:04:05"),
+			Message: "连接中断，正在重连"})
+		log.Printf("tunnel transport down, reconnecting...")
+	}
 }
 
 // beginRehandshake 发送握手请求；Reply 由唯一读循环识别并热切换密钥。
@@ -195,8 +257,12 @@ func (c *client) beginRehandshake() {
 	c.pending = nonce
 	c.mu.Unlock()
 	pkt := c.boot.Seal(common.TypeHandshake, nonce, common.RandomPrefix())
-	_ = c.udp.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	if _, err := c.udp.Write(pkt); err != nil {
+	conn := c.curUDP()
+	if conn == nil {
+		return
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write(pkt); err != nil {
 		log.Printf("re-handshake send: %v", err)
 	}
 }
@@ -238,15 +304,16 @@ func (c *client) tryHandleReply(raw []byte) bool {
 }
 
 func (c *client) heartbeat() {
-	tk := time.NewTicker(10 * time.Second)
+	tk := time.NewTicker(5 * time.Second)
 	defer tk.Stop()
 	for range tk.C {
 		_ = c.writeFrame(common.TypePing, nil)
 		now := time.Now().Format("2006-01-02 15:04:05")
 		state := "connected"
 		msg := "已连接，公网端口落地中"
-		if time.Since(c.lastActivity()) > 90*time.Second {
-			log.Printf("no traffic for 90s, sending re-handshake")
+		// 25 秒无任何入向报文（含 Pong）：判定 NAT 映射可能已失效，立即用握手帧重建
+		if time.Since(c.lastActivity()) > 25*time.Second {
+			log.Printf("no inbound traffic for 25s, sending re-handshake")
 			c.beginRehandshake()
 			state = "connecting"
 			msg = "连接中断，正在重连"
@@ -255,6 +322,12 @@ func (c *client) heartbeat() {
 			LandingIP: c.landing, MTU: c.mtu, PID: os.Getpid(),
 			StartedAt: c.startedAt, LastSeen: now, Message: msg})
 	}
+}
+
+func (c *client) curMTU() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.mtu
 }
 
 func (c *client) touchActivity() { c.activity.Store(time.Now().UnixNano()) }
@@ -268,12 +341,14 @@ func (c *client) lastActivity() time.Time {
 
 func (c *client) writeFrame(t byte, body []byte) error {
 	key := c.currentKey()
-	if key == nil {
-		return fmt.Errorf("no session key")
+	conn := c.curUDP()
+	if key == nil || conn == nil {
+		return fmt.Errorf("transport not ready")
 	}
 	pkt := key.Seal(t, body, common.RandomPrefix())
-	_ = c.udp.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	_, err := c.udp.Write(pkt)
+	// 数据信道不逐包重置写 deadline（连接建立时已清除为永久阻塞）
+	c.pacer.Wait()
+	_, err := conn.Write(pkt)
 	return err
 }
 
@@ -299,17 +374,22 @@ func (c *client) wintunToServer() {
 	}
 }
 
-// serverToWintun：服务器 -> 解密 -> wintun -> 本机协议栈（服务看到真实访问者 IP）
-func (c *client) serverToWintun() {
+// readServerLoop：服务器 -> 解密 -> wintun -> 本机协议栈（服务看到真实访问者 IP）。
+// 读取报错即返回，由 transportLoop 重新拨号握手，本函数不再"静默永久退出"。
+func (c *client) readServerLoop(conn *net.UDPConn) {
 	buf := make([]byte, common.MaxPacket+64)
 	c.touchActivity()
 	for {
-		n, err := c.udp.Read(buf)
+		n, err := conn.Read(buf)
 		if err != nil {
 			log.Printf("udp read: %v", err)
 			return
 		}
-		t, body, err := c.currentKey().Open(buf[:n])
+		key := c.currentKey()
+		if key == nil {
+			continue
+		}
+		t, body, err := key.Open(buf[:n])
 		if err != nil {
 			// 数据密钥解不开：可能是重连过程中的握手回复
 			if raw := buf[:n]; len(raw) > 0 && raw[0] == common.TypeReply {
@@ -323,7 +403,7 @@ func (c *client) serverToWintun() {
 		if t == common.TypePong || len(body) == 0 {
 			continue
 		}
-		if t != common.TypeData || len(body) > c.mtu {
+		if t != common.TypeData || len(body) > c.curMTU() {
 			continue
 		}
 		out, err := c.session.AllocateSendPacket(len(body))
@@ -467,14 +547,21 @@ func configureNetworking(adapterName, tunIdx string, cfg *common.Config, phys *p
 	if mtu == 0 {
 		mtu = common.MTU
 	}
-	if err := runCmd("netsh", "interface", "ipv4", "set", "interface",
-		fmt.Sprintf("name=%s", adapterName), "mtu="+fmt.Sprint(mtu), "metric=999"); err != nil {
-		log.Printf("warn: set interface metric: %v", err)
+	// 设置 wintun 的 MTU 与接口 metric。
+	// 注意：netsh "set interface" 对 wintun 虚拟网卡会静默不生效（MTU 停留 65535），
+	// 必须用 Set-NetIPInterface；metric 999 保证不抢占物理网卡默认路由。
+	mssScript := fmt.Sprintf(
+		"Set-NetIPInterface -InterfaceAlias '%s' -AddressFamily IPv4 -NlMtu %d -InterfaceMetric 999 -ErrorAction Stop",
+		adapterName, mtu)
+	if _, err := psOutput(mssScript); err != nil {
+		log.Printf("warn: set wintun mtu/metric: %v", err)
 	}
 
 	// wintun 上配置落地地址（/32，避免在本地产生多余 on-link 网段）
+	// wintun 适配器 GUID 由名字派生，进程重启后旧地址仍在，"已存在"按成功处理
 	if err := runCmd("netsh", "interface", "ipv4", "add", "address",
-		fmt.Sprintf("name=%s", adapterName), cfg.TunIP, "255.255.255.255"); err != nil {
+		fmt.Sprintf("name=%s", adapterName), cfg.TunIP, "255.255.255.255"); err != nil &&
+		!strings.Contains(err.Error(), "already exists") {
 		return fmt.Errorf("add address: %w", err)
 	}
 

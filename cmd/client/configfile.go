@@ -52,7 +52,7 @@ func SaveFileConfig(fc *FileConfig) error {
 
 // StatusInfo 写入 %ProgramData%\iptun\status-<adapter>.json，供 GUI 展示连接状态。
 type StatusInfo struct {
-	State     string `json:"state"`      // connecting / connected / stopped / error
+	State     string `json:"state"` // connecting / connected / stopped / error
 	Server    string `json:"server"`
 	Adapter   string `json:"adapter"`
 	LandingIP string `json:"landing_ip"`

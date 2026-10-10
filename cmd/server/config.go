@@ -87,7 +87,10 @@ func (c *NodeConfig) Validate() error {
 		}
 	}
 	// 同一协议下端口段不得跨客户端重叠（iptables 首条命中会导致分流歧义）
-	type seg struct{ name, proto string; lo, hi int }
+	type seg struct {
+		name, proto string
+		lo, hi      int
+	}
 	var segs []seg
 	for i := range c.Clients {
 		cl := &c.Clients[i]
@@ -124,8 +127,18 @@ func (c *NodeConfig) Validate() error {
 	return nil
 }
 
-func maxInt(a, b int) int { if a > b { return a }; return b }
-func minInt(a, b int) int { if a < b { return a }; return b }
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
 
 func (c *NodeConfig) Snapshot() []ClientDef {
 	c.mu.RLock()

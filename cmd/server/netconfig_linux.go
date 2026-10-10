@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 )
@@ -98,7 +99,8 @@ func setupTunAddress(tunName, serverIP string, prefix int) error {
 // setupNetworking 依据客户端列表生成"端口段 -> 落地地址"的 DNAT 规则。
 // 支持热更新：整体清空重建自定义链（原子性由 iptables-restore 更好，此处规模小可接受）。
 // webPort 是本机 Web 控制台端口，必须在端口段分流之前 RETURN，否则会被自己的规则劫持进隧道。
-func setupNetworking(w *wanInfo, tunName string, tunnelPort, webPort, mss int, cfg *NodeConfig) error {
+func setupNetworking(w *wanInfo, tunName string, tunnelPort, webPort, mtu int, cfg *NodeConfig) error {
+	applyNetSysctl()
 	runQuiet("sysctl", "-w", "net.ipv4.ip_forward=1")
 	runQuiet("sysctl", "-w", "net.ipv4.conf.all.rp_filter=2")
 	runQuiet("sysctl", "-w", fmt.Sprintf("net.ipv4.conf.%s.rp_filter=0", w.Dev))
@@ -184,6 +186,8 @@ func setupNetworking(w *wanInfo, tunName string, tunnelPort, webPort, mss int, c
 	}
 
 	runQuiet("iptables", "-P", "FORWARD", "ACCEPT")
+	// MSS = 虚拟 MTU - 60（IP40 + 20 余量），保证隧道内 TCP 满载段封装后仍小于外层路径 MTU
+	mss := mtu - 60
 	mssRules := [][]string{
 		{"-A", "FORWARD", "-o", tunName, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", fmt.Sprint(mss)},
 		{"-A", "FORWARD", "-i", tunName, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", fmt.Sprint(mss)},
@@ -201,10 +205,36 @@ func addDNAT(proto, portRange, landing string) error {
 		"-j", "DNAT", "--to-destination", landing)
 }
 
-func cleanupNetworking(w *wanInfo, tunName string) {
+func cleanupNetworking(w *wanInfo, tunName string, mtu int) {
+	mss := mtu - 60
 	_ = ipt("-t", "nat", "-D", "PREROUTING", "-i", w.Dev, "-d", w.IP, "-j", natChain)
 	_ = ipt("-t", "nat", "-F", natChain)
 	_ = ipt("-t", "nat", "-X", natChain)
-	_ = ipt("-t", "mangle", "-D", "FORWARD", "-o", tunName, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1320")
-	_ = ipt("-t", "mangle", "-D", "FORWARD", "-i", tunName, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1320")
+	// 删除当前及历史版本可能遗留的 MSS 规则（旧版曾用 mtu-80=1320）
+	for _, old := range []int{mss, mtu - 80} {
+		_ = ipt("-t", "mangle", "-D", "FORWARD", "-o", tunName, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", fmt.Sprint(old))
+		_ = ipt("-t", "mangle", "-D", "FORWARD", "-i", tunName, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", fmt.Sprint(old))
+	}
+}
+
+// applyNetSysctl 提升隧道相关内核网络参数并持久化（运行时生效 + 重启保留）。
+// 关键：SetReadBuffer 请求的缓冲会被 rmem_max/wmem_max 静默截断（Ubuntu 默认仅 208KB），
+// 突发时直接 RcvbufErrors 丢包，表现为隧道内 TCP 秒级卡顿。
+func applyNetSysctl() {
+	kv := []string{
+		"net.core.rmem_max=16777216",
+		"net.core.wmem_max=16777216",
+		"net.core.rmem_default=4194304",
+		"net.core.wmem_default=4194304",
+		"net.core.netdev_max_backlog=16384",
+		"net.core.netdev_budget=600",
+		"net.netfilter.nf_conntrack_max=262144",
+	}
+	args := []string{"-w"}
+	args = append(args, kv...)
+	runQuiet("sysctl", args...)
+	// conntrack 模块未加载时上一条会静默失败，不影响其它参数
+	_ = os.WriteFile("/etc/sysctl.d/99-iptun.conf",
+		[]byte("# managed by iptun, do not edit manually\n"+
+			strings.Join(kv, "\n")+"\n"), 0o644)
 }

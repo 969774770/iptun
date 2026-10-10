@@ -21,6 +21,19 @@ SRC="$(cd "$(dirname "$0")" && pwd)/iptun-server"
 command -v ip >/dev/null || { info "安装 iproute2/iptables"; apt-get update -qq && apt-get install -y -qq iproute2 iptables; }
 [ -c /dev/net/tun ] || { warn "/dev/net/tun 不存在，部分 VPS 需在控制面板开启 TUN/TAP"; }
 
+# 内核网络参数：放大 UDP 缓冲/网卡积压/conntrack，避免突发丢包导致隧道内卡顿
+cat > /etc/sysctl.d/99-iptun.conf <<'EOF'
+# managed by iptun, do not edit manually
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.core.rmem_default=4194304
+net.core.wmem_default=4194304
+net.core.netdev_max_backlog=16384
+net.core.netdev_budget=600
+net.netfilter.nf_conntrack_max=262144
+EOF
+sysctl -p /etc/sysctl.d/99-iptun.conf >/dev/null 2>&1 || true
+
 mkdir -p "$INSTALL_DIR"
 install -m 755 "$SRC" "$INSTALL_DIR/iptun-server"
 

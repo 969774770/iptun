@@ -12,10 +12,10 @@ import (
 )
 
 const (
-	cIFF_TUN          = 0x0001
-	cIFF_NO_PI        = 0x1000
-	cTUNSETIFF        = 0x400454ca
-	cTUNSETPERSIST    = 0x400454cb
+	cIFF_TUN       = 0x0001
+	cIFF_NO_PI     = 0x1000
+	cTUNSETIFF     = 0x400454ca
+	cTUNSETPERSIST = 0x400454cb
 )
 
 type ifreqFlags struct {
@@ -41,7 +41,8 @@ func createTUN(name string, mtu int) (*os.File, string, error) {
 	}
 	actual := string(bytes.TrimRight(req.Name[:], "\x00"))
 
-	if err := run("ip", "link", "set", "dev", actual, "up", "mtu", fmt.Sprint(mtu)); err != nil {
+	// txqueuelen 加大：默认 500 在突发时会导致写 TUN 阻塞/丢包
+	if err := run("ip", "link", "set", "dev", actual, "up", "mtu", fmt.Sprint(mtu), "txqueuelen", "1000"); err != nil {
 		unix.Close(fd)
 		return nil, "", err
 	}
