@@ -305,10 +305,13 @@ namespace IptunGui
                 StopIfRunning(name);
                 RunSc("delete", name, "", true);
                 // binPath 只带 -adapter；服务器/Token/密钥由 config.json 提供
-                string binPath = "\"" + ClientExe + "\" -adapter " + c.adapter;
+                // 注意：sc.exe 的 binPath 值带启动参数时，整个值必须用外层引号包裹、
+                // 内部引号用 \" 转义；否则当安装路径含空格（OneDrive/Program Files/
+                // 微信接收文件夹等）时 sc create 会报用法错误。
+                string binPath = "\\\"" + ClientExe + "\\\" -adapter " + c.adapter;
                 RunSc("create", name,
-                    "binPath= " + binPath + " start= auto DisplayName= iptun公网IP落地客户端(" + name + ")", false);
-                RunSc("description", name, "iptun 加密三层隧道客户端（公网IP落地，真实访问者IP透传）", false);
+                    "binPath= \"" + binPath + "\" start= auto DisplayName= \"iptun公网IP落地客户端(" + name + ")\"", false);
+                RunSc("description", name, "\"iptun 加密三层隧道客户端（公网IP落地，真实访问者IP透传）\"", false);
                 RunSc("failure", name, "reset= 86400 actions= restart/5000/restart/5000/restart/5000", true);
                 RunSc("start", name, "", false);
                 lblMsg.ForeColor = Color.FromArgb(22, 101, 52);
