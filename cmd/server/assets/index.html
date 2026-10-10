@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>iptun 控制台</title>
+<link rel="stylesheet" href="/static/bootstrap.min.css">
+<style>
+body{background:#f4f6fa;font-size:.92rem}
+.navbar{box-shadow:0 1px 4px rgba(0,0,0,.08)}
+.app-card{border:none;border-radius:.85rem;box-shadow:0 1px 3px rgba(16,24,40,.06)}
+.stat-card{border-radius:.85rem;border:1px solid #eef1f6;padding:16px 18px;height:100%;background:#fff}
+.stat-card .k{color:#6b7688;font-size:.82rem}
+.stat-card .v{font-size:1.35rem;font-weight:700;color:#16203a;margin-top:2px;word-break:break-all}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:middle}
+.on{background:#19c37d;box-shadow:0 0 0 3px rgba(25,195,125,.15)}
+.off{background:#c2c9d4}
+.badge-rule{font-weight:500;margin:1px 3px 1px 0}
+.mono{font-family:ui-monospace,Consolas,monospace;font-size:.85em}
+.login-wrap{min-height:100vh;display:flex;align-items:center;background:linear-gradient(135deg,#eef4ff,#f7fafc)}
+.table td{vertical-align:middle}
+.rule-conflict{font-size:.78rem;margin-top:3px}
+.rule-row{background:#fafbfd;border:1px solid #e9edf3;border-radius:.5rem;padding:10px;margin-bottom:8px}
+#clientModal .form-label{font-weight:600;margin-bottom:3px}
+.muted{color:#7a869a;font-size:.84rem}
+.pill{font-size:.78rem}
+</style>
+</head>
+<body>
+
+<!-- 登录页 -->
+<div id="loginPage" class="login-wrap" style="display:none">
+  <div class="card app-card mx-auto" style="width:380px">
+    <div class="card-body p-4">
+      <div class="text-center mb-4">
+        <div style="font-size:1.6rem;font-weight:800;color:#1e40af">iptun</div>
+        <div class="muted">公网 IP 落地 · 管理控制台</div>
+      </div>
+      <label class="form-label">账号</label>
+      <input id="loginUser" class="form-control mb-2" value="admin">
+      <label class="form-label">密码</label>
+      <input id="loginPass" type="password" class="form-control mb-3" autocomplete="current-password">
+      <button class="btn btn-primary w-100" onclick="doLogin()">登 录</button>
+      <div id="loginErr" class="text-danger small mt-2" style="display:none"></div>
+    </div>
+  </div>
+</div>
+
+<!-- 主界面 -->
+<div id="appPage" style="display:none">
+<nav class="navbar navbar-expand-lg navbar-light bg-white mb-4">
+  <div class="container">
+    <span class="navbar-brand fw-bold text-primary mb-0">⚡ iptun 控制台</span>
+    <ul class="navbar-nav me-auto">
+      <li class="nav-item"><a class="nav-link" data-tab="dashboard" href="javascript:">总览</a></li>
+      <li class="nav-item"><a class="nav-link" data-tab="clients" href="javascript:">客户端</a></li>
+      <li class="nav-item"><a class="nav-link" data-tab="settings" href="javascript:">节点设置</a></li>
+    </ul>
+    <span class="navbar-text me-3" id="navStatus"></span>
+    <button class="btn btn-outline-secondary btn-sm" onclick="doLogout()">退出</button>
+  </div>
+</nav>
+
+<div class="container pb-5">
+  <!-- 总览 -->
+  <div id="tab-dashboard">
+    <div class="row g-3 mb-3">
+      <div class="col-6 col-lg-3"><div class="stat-card"><div class="k">公网 IP</div><div class="v mono" id="st_pub">-</div></div></div>
+      <div class="col-6 col-lg-3"><div class="stat-card"><div class="k">在线客户端</div><div class="v" id="st_online">-</div></div></div>
+      <div class="col-6 col-lg-3"><div class="stat-card"><div class="k">隧道端口 (UDP)</div><div class="v mono" id="st_port">-</div></div></div>
+      <div class="col-6 col-lg-3"><div class="stat-card"><div class="k">运行时长</div><div class="v" id="st_uptime">-</div></div></div>
+    </div>
+    <div class="row g-3">
+      <div class="col-12 col-lg-6">
+        <div class="card app-card"><div class="card-body">
+          <h6 class="fw-bold mb-3">系统资源</h6>
+          <table class="table table-sm mb-0">
+            <tr><td class="muted" style="width:110px">主机名</td><td id="sys_host" class="mono">-</td></tr>
+            <tr><td class="muted">系统 / 内核</td><td id="sys_os" class="mono">-</td></tr>
+            <tr><td class="muted">CPU 核心</td><td id="sys_cpu" class="mono">-</td></tr>
+            <tr><td class="muted">负载(1分钟)</td><td id="sys_load" class="mono">-</td></tr>
+            <tr><td class="muted">内存</td><td><div class="d-flex align-items-center gap-2"><div class="progress flex-grow-1" style="height:8px"><div id="sys_membar" class="progress-bar" style="width:0%"></div></div><span id="sys_mem" class="mono small">-</span></div></td></tr>
+          </table>
+        </div></div>
+      </div>
+      <div class="col-12 col-lg-6">
+        <div class="card app-card"><div class="card-body">
+          <h6 class="fw-bold mb-3">实时状态</h6>
+          <div id="dash_clients" class="d-flex flex-column gap-2"></div>
+        </div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 客户端 -->
+  <div id="tab-clients" style="display:none">
+    <div class="card app-card"><div class="card-body">
+      <div class="d-flex justify-content-between align-items-center mb-3">
+        <h6 class="fw-bold mb-0">客户端与端口段</h6>
+        <button class="btn btn-primary btn-sm" onclick="editClient(-1)">+ 新增客户端</button>
+      </div>
+      <div class="table-responsive">
+      <table class="table table-hover align-middle">
+        <thead><tr><th>状态</th><th>名称</th><th>落地 IP</th><th>Token</th><th>端口段</th><th>流量 ↓/↑</th><th>速率</th><th>操作</th></tr></thead>
+        <tbody id="clientBody"></tbody>
+      </table>
+      </div>
+      <div class="muted mt-2">保存时自动检测：端口段相互重叠、本机已占用端口（SSH/Web/隧道/系统服务）都会被拒绝并提示。</div>
+    </div></div>
+  </div>
+
+  <!-- 节点设置 -->
+  <div id="tab-settings" style="display:none">
+    <div class="row g-3">
+      <div class="col-12 col-lg-6">
+        <div class="card app-card"><div class="card-body">
+          <h6 class="fw-bold mb-3">隧道端口</h6>
+          <p class="muted">客户端连接的 UDP 端口，默认 7000。修改后所有客户端需用新端口重连，且云安全组要放行新 UDP 端口。</p>
+          <div class="input-group" style="max-width:280px">
+            <span class="input-group-text">UDP</span>
+            <input id="set_port" type="number" class="form-control" min="1" max="65535">
+            <button class="btn btn-warning" onclick="changeTunnelPort()">应用</button>
+          </div>
+          <div id="set_port_msg" class="small mt-2"></div>
+        </div></div>
+      </div>
+      <div class="col-12 col-lg-6">
+        <div class="card app-card"><div class="card-body">
+          <h6 class="fw-bold mb-3">修改管理员账号/密码</h6>
+          <label class="form-label">账号</label><input id="set_user" class="form-control mb-2" value="admin">
+          <label class="form-label">原密码</label><input id="set_oldpass" type="password" class="form-control mb-2">
+          <label class="form-label">新密码（≥8位）</label><input id="set_newpass" type="password" class="form-control mb-3">
+          <button class="btn btn-primary" onclick="changePassword()">保存并重新登录</button>
+          <div id="set_pass_msg" class="small mt-2"></div>
+        </div></div>
+      </div>
+      <div class="col-12">
+        <div class="card app-card"><div class="card-body">
+          <h6 class="fw-bold mb-3">本机已监听端口 <button class="btn btn-outline-secondary btn-sm float-end" onclick="loadListeners()">刷新</button></h6>
+          <p class="muted">分配端口段时，这些端口会被标记为“本机占用”，请避开（系统已自动保留 SSH/Web/隧道）。</p>
+          <div class="table-responsive"><table class="table table-sm mb-0">
+            <thead><tr><th style="width:90px">协议</th><th style="width:120px">端口</th><th>占用进程</th></tr></thead>
+            <tbody id="listenBody"></tbody>
+          </table></div>
+        </div></div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- 客户端编辑弹窗 -->
+<div class="modal fade" id="clientModal" tabindex="-1">
+ <div class="modal-dialog modal-lg modal-dialog-centered">
+  <div class="modal-content">
+   <div class="modal-header"><h5 class="modal-title" id="m_title">编辑客户端</h5><button class="btn-close" data-bs-dismiss="modal"></button></div>
+   <div class="modal-body">
+     <div class="row g-2">
+       <div class="col-6 col-md-3">
+         <label class="form-label">名称</label>
+         <input id="m_name" class="form-control form-control-sm" placeholder="如 game1">
+       </div>
+       <div class="col-6 col-md-3">
+         <label class="form-label">落地 IP</label>
+         <input id="m_landing" class="form-control form-control-sm mono" placeholder="10.66.0.2">
+       </div>
+       <div class="col-12 col-md-6">
+         <label class="form-label">Token <button class="btn btn-outline-secondary btn-xs btn-sm py-0 px-2 float-end" onclick="genToken()">随机生成</button></label>
+         <input id="m_token" class="form-control form-control-sm mono">
+       </div>
+     </div>
+     <div class="form-check mt-3"><input type="checkbox" class="form-check-input" id="m_enabled" checked><label class="form-check-label" for="m_enabled">启用该客户端</label></div>
+     <hr>
+     <div class="d-flex justify-content-between align-items-center">
+       <label class="form-label mb-0 fw-bold">分流规则（协议 + 端口段）</label>
+       <div>
+         <button class="btn btn-outline-primary btn-sm py-0" onclick="addRule('tcp')">+ TCP</button>
+         <button class="btn btn-outline-primary btn-sm py-0" onclick="addRule('udp')">+ UDP</button>
+         <button class="btn btn-outline-primary btn-sm py-0" onclick="addRule('all')">+ TCP/UDP</button>
+         <button class="btn btn-outline-secondary btn-sm py-0" onclick="addRule('icmp')">+ ICMP</button>
+       </div>
+     </div>
+     <div id="rulesBox" class="mt-2"></div>
+     <div id="ruleGlobalMsg" class="rule-conflict"></div>
+     <div class="text-secondary small mt-2">提示：仅 SSH、面板端口、隧道端口为强制保留；被本机系统服务占用的端口（如 DNS/DHCP）会<b>自动留在本机</b>无需手动排除。输入时不打断，停止输入后才检测。</div>
+     <hr>
+     <label class="form-label fw-bold">客户端启动命令（保存后可直接复制给用户）</label>
+     <pre id="m_cmd" class="bg-light border rounded p-2 small mono mb-0" style="white-space:pre-wrap;word-break:break-all"></pre>
+   </div>
+   <div class="modal-footer">
+     <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+     <button class="btn btn-primary" id="m_saveBtn" onclick="saveClient()">保存</button>
+   </div>
+  </div>
+ </div>
+</div>
+
+<div class="toast-container position-fixed bottom-0 end-0 p-3">
+  <div id="toast" class="toast align-items-center text-bg-primary border-0"><div class="d-flex">
+    <div class="toast-body" id="toastBody"></div>
+    <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button>
+  </div></div>
+</div>
+
+<script src="/static/bootstrap.bundle.min.js"></script>
+<script>
+var S=null, CLIENTS=[], EDIT=-1, DRAFT=null, ruleCheckTimer=null, ruleCheckCache={};
+
+function api(path,opt){
+  opt=opt||{};opt.credentials='same-origin';
+  opt.headers=Object.assign({'Content-Type':'application/json'},opt.headers||{});
+  return fetch(path,opt).then(function(r){
+    if(r.status===401){showLogin();throw new Error('unauthorized')}
+    return r.json().then(function(j){if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j});
+  });
+}
+function toast(m,err){var t=document.getElementById('toast');document.getElementById('toastBody').textContent=m;t.className='toast align-items-center border-0 '+(err?'text-bg-danger':'text-bg-success');new bootstrap.Toast(t,{delay:3500}).show()}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(m){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]})}
+function fmtB(n){if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(1)+' KB';if(n<1073741824)return (n/1048576).toFixed(1)+' MB';return (n/1073741824).toFixed(2)+' GB'}
+function fmtRate(n){if(!n)return '-';return fmtB(n)+'/s'}
+function fmtUptime(s){var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+'天 ':'')+h+'小时 '+m+'分'}
+
+/* ---------- 登录 ---------- */
+function showLogin(){document.getElementById('loginPage').style.display='block';document.getElementById('appPage').style.display='none'}
+function showApp(){document.getElementById('loginPage').style.display='none';document.getElementById('appPage').style.display='block'}
+function doLogin(){
+  document.getElementById('loginErr').style.display='none';
+  api('/api/login',{method:'POST',body:JSON.stringify({user:loginUser.value,pass:loginPass.value})})
+  .then(function(){loginPass.value='';switchTab('dashboard');refreshAll()})
+  .catch(function(e){var el=document.getElementById('loginErr');el.textContent=e.message;el.style.display='block'});
+}
+function doLogout(){api('/api/logout',{method:'POST'}).then(showLogin)}
+loginPass.addEventListener('keydown',function(e){if(e.key==='Enter')doLogin()});
+
+/* ---------- 标签页 ---------- */
+document.querySelectorAll('.nav-link[data-tab]').forEach(function(a){
+  a.addEventListener('click',function(){switchTab(a.dataset.tab)});
+});
+function switchTab(name){
+  document.querySelectorAll('[id^="tab-"]').forEach(function(d){d.style.display='none'});
+  document.getElementById('tab-'+name).style.display='block';
+  document.querySelectorAll('.nav-link').forEach(function(a){a.classList.toggle('active',a.dataset.tab===name)});
+  if(name==='settings')loadSettings();
+}
+
+/* ---------- 数据加载 ---------- */
+function refreshAll(){
+  return api('/api/summary').then(function(d){
+    S=d;CLIENTS=d.clients;
+    showApp();
+    st_pub.textContent=d.public_ip||'（未获取）';
+    var on=d.clients.filter(function(c){return c.online}).length;
+    st_online.textContent=on+' / '+d.clients.length;
+    st_port.textContent=d.tunnel_port;
+    st_uptime.textContent=fmtUptime(d.uptime_sec);
+    navStatus.innerHTML='<span class="dot on"></span>'+(d.public_ip||d.wan_ip);
+    renderClients();
+    renderDash();
+  }).catch(function(){});
+}
+function renderDash(){
+  var box=document.getElementById('dash_clients');box.innerHTML='';
+  if(!CLIENTS.length){box.innerHTML='<div class="muted">暂无客户端，请到「客户端」页新增。</div>';return}
+  CLIENTS.forEach(function(c){
+    box.innerHTML+='<div class="d-flex justify-content-between align-items-center border rounded px-3 py-2">'+
+      '<div><span class="dot '+(c.online?'on':'off')+'"></span><b>'+esc(c.name)+'</b> <span class="muted mono">'+esc(c.landing)+'</span></div>'+
+      '<div class="small">'+(c.online?'<span class="text-success">在线 '+esc(c.address)+'</span> · ↓'+fmtB(c.tx_bytes)+' ↑'+fmtB(c.rx_bytes):'<span class="muted">离线</span>')+'</div></div>';
+  });
+}
+function loadSys(){
+  api('/api/sysinfo').then(function(d){
+    sys_host.textContent=d.hostname;sys_os.textContent=esc((d.os||'')+' '+d.kernel);sys_cpu.textContent=d.cpu_cores+' 核';
+    sys_load.textContent=d.load1.toFixed(2)+' / '+d.cpu_cores+' 核';
+    sys_mem.textContent=d.mem_used_mb+' / '+d.mem_total_mb+' MB ('+d.mem_used_pct.toFixed(0)+'%)';
+    sys_membar.style.width=Math.min(100,d.mem_used_pct)+'%';
+    sys_membar.className='progress-bar '+(d.mem_used_pct>85?'bg-danger':d.mem_used_pct>65?'bg-warning':'bg-success');
+  }).catch(function(){});
+}
+
+/* ---------- 客户端表格 ---------- */
+function renderClients(){
+  var tb=document.getElementById('clientBody');tb.innerHTML='';
+  CLIENTS.forEach(function(c,i){
+    var rules=(c.rules||[]).map(function(r){
+      if(r.proto==='icmp')return '<span class="badge bg-secondary badge-rule">icmp</span>';
+      return '<span class="badge bg-info bg-opacity-10 text-info-emphasis badge-rule">'+r.proto+' '+r.port_start+'-'+r.port_end+'</span>';
+    }).join('');
+    var tr=document.createElement('tr');
+    tr.innerHTML='<td><span class="dot '+(c.online?'on':'off')+'"></span>'+(c.online?'<span class="text-success">在线</span>':'<span class="muted">离线</span>')+(c.enabled?'':' <span class="badge bg-warning text-dark pill">停用</span>')+'</td>'+
+      '<td><b>'+esc(c.name)+'</b></td>'+
+      '<td class="mono">'+esc(c.landing)+'</td>'+
+      '<td class="mono" style="max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(c.token)+'">'+esc(c.token)+'</td>'+
+      '<td>'+rules+'</td>'+
+      '<td class="mono small">'+(c.online?fmtB(c.tx_bytes)+' / '+fmtB(c.rx_bytes):'-')+'</td>'+
+      '<td class="mono small">'+(c.online?fmtRate(c.tx_rate)+' / '+fmtRate(c.rx_rate):'-')+'</td>'+
+      '<td><button class="btn btn-sm btn-outline-primary py-0" onclick="editClient('+i+')">编辑</button> <button class="btn btn-sm btn-outline-danger py-0" onclick="delClient('+i+')">删除</button></td>';
+    tb.appendChild(tr);
+  });
+}
+
+/* ---------- 编辑弹窗 ---------- */
+function nextLanding(){
+  var used={};CLIENTS.forEach(function(c){used[c.landing]=1});
+  for(var i=2;i<250;i++){var ip='10.66.0.'+i;if(!used[ip])return ip}
+  return '10.66.0.2';
+}
+function genToken(){
+  var a=new Uint8Array(20);crypto.getRandomValues(a);var h='';
+  a.forEach(function(x){h+=x.toString(16).padStart(2,'0')});m_token.value=h;
+}
+function editClient(i){
+  EDIT=i;
+  DRAFT=i>=0?JSON.parse(JSON.stringify(CLIENTS[i])):{name:'',token:'',landing:nextLanding(),enabled:true,rules:[{proto:'all',port_start:1,port_end:10000}]};
+  m_title.textContent=i>=0?'编辑客户端':'新增客户端';
+  m_name.value=DRAFT.name;m_token.value=DRAFT.token;m_landing.value=DRAFT.landing;m_enabled.checked=DRAFT.enabled;
+  renderRules();renderCmd();
+  new bootstrap.Modal(document.getElementById('clientModal')).show();
+  setTimeout(scheduleCheck,100);
+}
+/* 规则行只在【新增/删除/切换协议】时整体重建；
+   端口输入过程中绝不重建 DOM（避免丢焦点/卡顿），仅更新数据，停止输入 600ms 后做检测，
+   且检测结果只写进独立的提示行，不动输入框本身。 */
+function addRule(p){DRAFT.rules.push(p==='icmp'?{proto:'icmp'}:{proto:p,port_start:1,port_end:10000});renderRules();scheduleCheck()}
+function rmRule(i){DRAFT.rules.splice(i,1);renderRules();scheduleCheck()}
+function onProtoChange(i,val){
+  DRAFT.rules[i].proto=val;
+  if(val==='icmp'){delete DRAFT.rules[i].port_start;delete DRAFT.rules[i].port_end}
+  else if(!DRAFT.rules[i].port_start){DRAFT.rules[i].port_start=1;DRAFT.rules[i].port_end=10000}
+  renderRules();scheduleCheck();
+}
+function onPortInput(i,k,v){
+  // 仅更新数据（保留用户原始输入，输入中间态不做任何拦截/重建）
+  DRAFT.rules[i][k]=v===''?0:parseInt(v)||0;
+  renderCmd();scheduleCheck();
+}
+function renderRules(){
+  var box=document.getElementById('rulesBox');box.innerHTML='';
+  DRAFT.rules.forEach(function(r,i){
+    var d=document.createElement('div');d.className='rule-row';
+    var opts=['tcp','udp','all','icmp'].map(function(p){return '<option value="'+p+'" '+(r.proto===p?'selected':'')+'>'+p+'</option>'}).join('');
+    var portHtml = r.proto==='icmp'
+      ? '<span class="muted small">ICMP（ping）无端口概念</span>'
+      : '<div class="d-flex align-items-center gap-2"><span class="muted small">端口</span>'+
+        '<input class="form-control form-control-sm rstart" style="width:110px" value="'+(r.port_start||'')+'" inputmode="numeric" placeholder="起始" oninput="onPortInput('+i+',\'port_start\',this.value)">' +
+        '<span>-</span>'+
+        '<input class="form-control form-control-sm rend" style="width:110px" value="'+(r.port_end||'')+'" inputmode="numeric" placeholder="结束" oninput="onPortInput('+i+',\'port_end\',this.value)"></div>';
+    d.innerHTML='<div class="d-flex align-items-center justify-content-between mb-1">'+
+      '<select class="form-select form-select-sm" style="width:130px" onchange="onProtoChange('+i+',this.value)">'+opts+'</select>'+
+      '<button class="btn btn-sm btn-outline-danger py-0" onclick="rmRule('+i+')">删除</button></div>'+portHtml+
+      '<div class="rule-conflict" id="rc-'+i+'"></div>';
+    box.appendChild(d);
+  });
+}
+
+/* 停止输入 600ms 才检测；只更新提示行文本，不碰输入框 */
+var portReqSeq=0;
+function scheduleCheck(){clearTimeout(ruleCheckTimer);ruleCheckTimer=setTimeout(checkAllRules,600)}
+function setHint(i,html,cls){var el=document.getElementById('rc-'+i);if(el){el.innerHTML=html;el.className='rule-conflict '+(cls||'')}}
+function checkAllRules(){
+  var globalMsg=document.getElementById('ruleGlobalMsg');globalMsg.innerHTML='';
+  var hard=false,ranges=[];
+  DRAFT.rules.forEach(function(r,i){
+    setHint(i,'','');
+    if(r.proto==='icmp')return;
+    if(!r.port_start||!r.port_end||r.port_start<1||r.port_end>65535||r.port_start>r.port_end){
+      setHint(i,'<span class="text-warning">⚠ 正在输入有效端口范围（1-65535）…</span>');return; // 输入中间态：仅温和提示，不禁保存但也不发起后端检测
+    }
+    var protos=r.proto==='all'?['tcp','udp']:[r.proto];
+    protos.forEach(function(p){
+      ranges.forEach(function(x){
+        if(x.p===p && r.port_start<=x.hi && x.lo<=r.port_end){
+          setHint(i,'<span class="text-danger">⛔ 与本客户端另一条 '+p+' 规则重叠 '+maxS(r.port_start,x.lo)+'-'+minS(r.port_end,x.hi)+'</span>');hard=true;
+        }
+      });
+      ranges.push({p:p,lo:r.port_start,hi:r.port_end});
+    });
+  });
+  m_saveBtn.disabled=hard;
+
+  // 后端检测（仅对范围合法的规则）；本机占用=警告（自动例外），保留口/客户端重叠=硬冲突
+  var seq=++portReqSeq;
+  var tasks=[];
+  DRAFT.rules.forEach(function(r,idx){
+    if(r.proto==='icmp'||!r.port_start||!r.port_end||r.port_start>r.port_end)return;
+    ['tcp','udp'].forEach(function(p){
+      if(r.proto!=='all'&&r.proto!==p)return;
+      var exclude=EDIT>=0?CLIENTS[EDIT].name:'';
+      tasks.push(api('/api/portcheck',{method:'POST',body:JSON.stringify({proto:p,start:r.port_start,end:r.port_end,exclude_name:exclude})})
+        .then(function(res){return {idx:idx,proto:p,res:res}}));
+    });
+  });
+  Promise.all(tasks).then(function(rs){
+    if(seq!==portReqSeq)return; // 期间又输入了，丢弃过期结果
+    var hardMap={},warnMap={};
+    rs.forEach(function(t){
+      (t.res.conflicts||[]).forEach(function(x){hardMap[t.idx]=hardMap[t.idx]||[];hardMap[t.idx].push(x)});
+      (t.res.warnings||[]).forEach(function(x){warnMap[t.idx]=warnMap[t.idx]||[];warnMap[t.idx].push(x)});
+    });
+    var anyHard=false;
+    Object.keys(hardMap).forEach(function(k){
+      var arr=hardMap[k];if(!arr.length)return;anyHard=true;
+      setHint(k,arr.slice(0,5).map(function(x){
+        if(x.type==='reserved')return '<span class="text-danger">⛔ '+esc(x.port)+' 是强制保留端口（'+esc(x.detail)+'），不可转发</span>';
+        return '<span class="text-danger">⛔ 与 '+esc(x.detail)+' 在 '+x.start+'-'+x.end+' 重叠</span>';
+      }).join('<br>'),'');
+    });
+    Object.keys(warnMap).forEach(function(k){
+      if(hardMap[k]&&hardMap[k].length)return;
+      var arr=warnMap[k];if(!arr.length)return;
+      var list=arr.slice(0,6).map(function(x){return '端口 '+x.port+'（'+esc(x.detail||'系统进程')+'）'});
+      setHint(k,'<span class="text-primary small">ℹ️ '+list.join('、')+(arr.length>6?' 等 '+arr.length+' 个':'')+' 被本机使用，<b>将自动保留在本机不转发</b>，其余端口正常落地</span>','');
+    });
+    m_saveBtn.disabled=anyHard||hard;
+  }).catch(function(){});
+}
+function maxS(a,b){return a>b?a:b}function minS(a,b){return a<b?a:b}
+
+function renderCmd(){
+  if(!DRAFT.token){m_cmd.textContent='（先填写或生成 Token）';return}
+  m_cmd.textContent='iptun-client.exe -server <服务器IP>:7000 -token '+DRAFT.token+' -adapter '+((DRAFT.name||'IPTun').toUpperCase().replace(/[^A-Z0-9_-]/g,''));
+}
+
+function saveClient(){
+  var d=DRAFT;
+  d.name=m_name.value.trim();d.token=m_token.value.trim();d.landing=m_landing.value.trim();d.enabled=m_enabled.checked;
+  if(!d.name||!/^[A-Za-z0-9_\-一-龥]{1,32}$/.test(d.name)){toast('名称必填（字母/数字/中文，≤32）',1);return}
+  if(!d.token){toast('Token 必填',1);return}
+  if(!/^10\.66\.0\.\d{1,3}$/.test(d.landing)){toast('落地 IP 需为 10.66.0.x',1);return}
+  if(!d.rules.length){toast('至少添加一条分流规则',1);return}
+  var list=CLIENTS.slice();
+  if(EDIT>=0)list[EDIT]=d;else list.push(d);
+  api('/api/clients',{method:'POST',body:JSON.stringify({clients:list})})
+  .then(function(){bootstrap.Modal.getInstance(document.getElementById('clientModal')).hide();toast('已保存并热生效');refreshAll()})
+  .catch(function(e){toast(e.message,1)});
+}
+function delClient(i){
+  if(!confirm('确定删除客户端 "'+CLIENTS[i].name+'" ？'))return;
+  var list=CLIENTS.slice();list.splice(i,1);
+  api('/api/clients',{method:'POST',body:JSON.stringify({clients:list})})
+  .then(function(){toast('已删除');refreshAll()}).catch(function(e){toast(e.message,1)});
+}
+
+/* ---------- 设置页 ---------- */
+function loadSettings(){
+  api('/api/settings/tunnel').then(function(d){set_port.value=d.tunnel_port});
+  loadListeners();
+}
+function loadListeners(){
+  api('/api/listenports').then(function(d){
+    var tb=document.getElementById('listenBody');tb.innerHTML='';
+    d.ports.forEach(function(p){
+      var badge=p.proto==='tcp'?'bg-primary':'bg-success';
+      tb.innerHTML+='<tr><td><span class="badge '+badge+'">'+p.proto.toUpperCase()+'</span></td><td class="mono">'+p.port+'</td><td class="mono">'+esc(p.proc||'-')+'</td></tr>';
+    });
+  });
+}
+function changeTunnelPort(){
+  var p=parseInt(set_port.value);
+  if(!p||p<1||p>65535){set_port_msg.innerHTML='<span class="text-danger">端口范围 1-65535</span>';return}
+  if(!confirm('确定把隧道端口改为 UDP '+p+' ？\n\n修改后：\n1. 所有客户端必须改用新端口重连；\n2. 云安全组需放行新 UDP 端口；\n3. 旧端口立即停止服务。'))return;
+  api('/api/settings/tunnel',{method:'POST',body:JSON.stringify({port:p})})
+  .then(function(d){set_port_msg.innerHTML='<span class="text-success">已切换到 UDP '+p+'</span><div class="text-warning mt-1">'+esc(d.warning)+'</div>';toast('隧道端口已切换');refreshAll()})
+  .catch(function(e){set_port_msg.innerHTML='<span class="text-danger">'+esc(e.message)+'</span>'});
+}
+function changePassword(){
+  api('/api/settings/password',{method:'POST',body:JSON.stringify({user:set_user.value.trim(),old:set_oldpass.value,new:set_newpass.value})})
+  .then(function(){set_pass(false);set_oldpass.value='';set_newpass.value='';document.getElementById('set_pass_msg').innerHTML='<span class="text-success">已修改，请重新登录</span>';setTimeout(doLogout,1200)})
+  .catch(function(e){document.getElementById('set_pass_msg').innerHTML='<span class="text-danger">'+esc(e.message)+'</span>'});
+}
+
+/* 表单变化实时联动 */
+document.addEventListener('input',function(e){
+  if(e.target.closest('#clientModal')){renderCmd();if(['m_name','m_token','m_landing'].indexOf(e.target.id)>=0){/* no port check */}}
+});
+
+/* 启动与定时刷新 */
+api('/api/summary').then(function(){switchTab('dashboard');refreshAll();setInterval(refreshAll,5000);setInterval(loadSys,10000);loadSys()}).catch(showLogin);
+</script>
+</body>
+</html>
