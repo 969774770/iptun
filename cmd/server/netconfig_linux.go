@@ -120,26 +120,25 @@ func setupNetworking(w *wanInfo, tunName string, tunnelPort, webPort, mtu int, c
 	//
 	//  1) 动态强制保留 3 个端口（值全部来自实时配置，不写死数字）：
 	//       SSH(22)、Web 面板(webPort)、隧道(tunnelPort/UDP)
-	//  2) -m socket：凡是本机【当前有监听 socket】的端口一律留本地。
-	//       这自动覆盖 DNS(53)/DHCP(67,68)/chrony(323) 等所有系统服务——
-	//       无需也不应把它们写进清单；转发这些会导致服务器失联/解析失败。
-	//  3) 其余一切才按客户端端口段 DNAT 进隧道。
+	//       无论用户是否把这些端口配给客户端，管理面永远优先，绝不被劫持。
+	//  2) 用户显式配置的客户端端口段 DNAT 优先于 -m socket：
+	//       用户在控制台把某端口分给客户端，就是明确声明该端口归隧道，
+	//       即使服务器本机恰好有程序监听该端口也应被转发（否则规则静默不生效，
+	//       用户会看到"端口通了但不是自己的服务"）。
+	//  3) -m socket 兜底：其余凡是本机【当前有监听 socket】的端口一律留本地。
+	//       自动覆盖 DNS(53)/DHCP(67,68)/chrony(323) 等所有未被用户分配的系统服务。
 	mustKeep := [][]string{
 		{"-p", "tcp", "--dport", "22", "-j", "RETURN"},
 		{"-p", "tcp", "--dport", fmt.Sprint(webPort), "-j", "RETURN"},
 		{"-p", "udp", "--dport", fmt.Sprint(tunnelPort), "-j", "RETURN"},
 	}
-	headRules := [][]string{
-		{"-m", "socket", "-j", "RETURN"},
-	}
-	headRules = append(headRules, mustKeep...)
-	for _, r := range headRules {
+	for _, r := range mustKeep {
 		if err := ipt(append([]string{"-t", "nat", "-A", natChain}, r...)...); err != nil {
 			return err
 		}
 	}
 
-	// 每个客户端的端口段规则
+	// 每个客户端的端口段规则（显式声明，优先于 socket 兜底）
 	icmpDone := false
 	for _, cl := range cfg.Clients {
 		if !cl.Enabled {
@@ -176,6 +175,11 @@ func setupNetworking(w *wanInfo, tunName string, tunnelPort, webPort, mtu int, c
 				}
 			}
 		}
+	}
+
+	// 3) socket 兜底：未被上面规则命中、但本机有监听 socket 的端口留本地（DNS/DHCP 等）
+	if err := ipt("-t", "nat", "-A", natChain, "-m", "socket", "-j", "RETURN"); err != nil {
+		return err
 	}
 
 	jump := []string{"-A", "PREROUTING", "-i", w.Dev, "-d", w.IP, "-j", natChain}
