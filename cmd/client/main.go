@@ -261,8 +261,12 @@ func (c *client) beginRehandshake() {
 	if conn == nil {
 		return
 	}
+	// 仅为本次握手设置写超时，写完立即复位；否则 deadline 会永久留在共享
+	// socket 上，5 秒后所有后续心跳/数据帧写入全部超时（状态却仍显示已连接）。
 	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	if _, err := conn.Write(pkt); err != nil {
+	_, err = conn.Write(pkt)
+	_ = conn.SetWriteDeadline(time.Time{})
+	if err != nil {
 		log.Printf("re-handshake send: %v", err)
 	}
 }
@@ -348,8 +352,19 @@ func (c *client) writeFrame(t byte, body []byte) error {
 	pkt := key.Seal(t, body, common.RandomPrefix())
 	// 数据信道不逐包重置写 deadline（连接建立时已清除为永久阻塞）
 	c.pacer.Wait()
-	_, err := conn.Write(pkt)
-	return err
+	if _, err := conn.Write(pkt); err != nil {
+		// 写失败通常意味着 socket 已失效：关闭它让 readServerLoop 退出，
+		// 由 transportLoop 重新拨号握手，避免数据面静默死亡。
+		log.Printf("udp write failed, forcing reconnect: %v", err)
+		c.connMu.Lock()
+		if c.udp == conn {
+			c.udp = nil
+		}
+		c.connMu.Unlock()
+		_ = conn.Close()
+		return err
+	}
+	return nil
 }
 
 // wintunToServer：本机协议栈 -> wintun -> 加密 -> 服务器
